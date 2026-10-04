@@ -49,7 +49,7 @@ import time
 # below). A plain dict behind a lock is enough; there's no need for
 # anything fancier at this scale.
 #
-# in_flight = {}  # orderId -> {...}
+in_flight = {}  # orderId -> {...}
 lock = threading.Lock()
 
 # TODO: how long should an order sit with no new results before you give up
@@ -108,8 +108,37 @@ def aggregate_result(ch, method, properties, body):
     result = json.loads(body)
     order_id = result['orderId']
 
-    # TODO: implement per the docstring above.
-    _ = order_id  # placeholder so linting doesn't complain about the unused var
+    completion_message = None
+
+    with lock:
+        if order_id not in in_flight:
+            in_flight[order_id] = {
+                'results': {},
+                'totalItems': result['totalItems'],
+                'lastActivity': time.time(),
+            }
+
+        order_state = in_flight[order_id]
+
+        item_index = result['itemIndex']
+        order_state['results'][item_index] = result
+        order_state['lastActivity'] = time.time()
+
+        if len(order_state['results']) == order_state['totalItems']:
+            completion_message = {
+                'orderId': order_id,
+                'correlationId': order_id,
+                'status': 'complete',
+                'totalItems': order_state['totalItems'],
+                'receivedItems': len(order_state['results']),
+                'itemResults': list(order_state['results'].values()),
+                'missingItemIndexes': [],
+            }
+
+            del in_flight[order_id]
+
+    if completion_message is not None:
+        publish_completion(completion_message)
 
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
@@ -131,7 +160,42 @@ def sweep_timeouts():
     """
     while True:
         time.sleep(SWEEP_INTERVAL_SECONDS)
-        # TODO: implement per the docstring above.
+
+        now = time.time()
+        timed_out_messages = []
+
+        with lock:
+            timed_out_order_ids = []
+
+            for order_id, order_state in in_flight.items():
+                if now - order_state['lastActivity'] > IDLE_TIMEOUT_SECONDS:
+                    total_items = order_state['totalItems']
+                    results = order_state['results']
+
+                    missing_indexes = [
+                        index
+                        for index in range(total_items)
+                        if index not in results
+                    ]
+
+                    partial_message = {
+                        'orderId': order_id,
+                        'correlationId': order_id,
+                        'status': 'partial',
+                        'totalItems': total_items,
+                        'receivedItems': len(results),
+                        'itemResults': list(results.values()),
+                        'missingItemIndexes': missing_indexes,
+                    }
+
+                    timed_out_messages.append(partial_message)
+                    timed_out_order_ids.append(order_id)
+
+            for order_id in timed_out_order_ids:
+                del in_flight[order_id]
+
+        for message in timed_out_messages:
+            publish_completion(message)
 
 
 def main():
