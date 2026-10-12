@@ -231,7 +231,15 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
  *   b2b:    "SKU-PROD-XXX"          -> strip the "SKU-" prefix -> "PROD-XXX"
  */
 export function normalizeProductId(source: "web" | "mobile" | "b2b", rawId: string): string {
-  throw new Error("TODO: normalizeProductId is not implemented");
+  if (source === "mobile") {
+    return `PROD-${rawId}`;
+  }
+
+  if (source === "b2b") {
+    return rawId.replace(/^SKU-/, "");
+  }
+
+  return rawId;
 }
 
 /**
@@ -246,7 +254,7 @@ export function normalizeProductId(source: "web" | "mobile" | "b2b", rawId: stri
  * doing arithmetic on it.
  */
 export function toDecimalAmount(price: number): string {
-  throw new Error("TODO: toDecimalAmount is not implemented");
+  return price.toFixed(2);
 }
 
 export type EnrichResult =
@@ -272,7 +280,47 @@ export async function enrichFromPricing(
   productId: string,
   options: TranslateOptions,
 ): Promise<EnrichResult> {
-  throw new Error("TODO: enrichFromPricing is not implemented");
+  try {
+    const response = await fetch(
+      `${options.pricingBaseUrl}/pricing/${encodeURIComponent(productId)}`,
+      {
+        headers: {
+          "X-API-Key": options.apiKey ?? DEFAULT_PRICING_API_KEY,
+        },
+      },
+    );
+
+    if (response.status === 404) {
+      return { status: "unknown_product" };
+    }
+
+    if (!response.ok) {
+      return {
+        status: "error",
+        httpStatus: response.status,
+      };
+    }
+
+    const data = (await response.json()) as {
+      unitPrice: number;
+      currency: string;
+      taxRate: number;
+      productName: string;
+    };
+
+    return {
+      status: "ok",
+      unitPrice: toDecimalAmount(data.unitPrice),
+      currency: data.currency,
+      taxRate: data.taxRate,
+      productName: data.productName,
+    };
+  } catch {
+    return {
+      status: "error",
+      httpStatus: 0,
+    };
+  }
 }
 
 /**
@@ -291,7 +339,37 @@ export async function enrichItems(
   lines: Array<{ productId: string; productName: string; quantity: number }>,
   options: TranslateOptions,
 ): Promise<{ items: CanonicalItem[]; warnings: TransformWarning[] }> {
-  throw new Error("TODO: enrichItems is not implemented");
+  const items: CanonicalItem[] = [];
+  const warnings: TransformWarning[] = [];
+
+  for (const line of lines) {
+    const result = await enrichFromPricing(line.productId, options);
+
+    if (result.status === "ok") {
+      items.push({
+        productId: line.productId,
+        productName: line.productName,
+        quantity: line.quantity,
+        unitPrice: result.unitPrice,
+        currency: result.currency,
+        taxRate: result.taxRate,
+      });
+    } else if (result.status === "unknown_product") {
+      warnings.push({
+        code: "UNKNOWN_PRODUCT",
+        productId: line.productId,
+        message: `Product ${line.productId} was not found in the pricing API`,
+      });
+    } else {
+      warnings.push({
+        code: "PRICING_API_ERROR",
+        productId: line.productId,
+        message: `Pricing API failed for ${line.productId} (HTTP ${result.httpStatus})`,
+      });
+    }
+  }
+
+  return { items, warnings };
 }
 
 /**
@@ -301,7 +379,7 @@ export async function enrichItems(
  * TODO is remembering the *1000 — this is seconds, not milliseconds.
  */
 export function epochSecondsToIso(epochSeconds: number): string {
-  throw new Error("TODO: epochSecondsToIso is not implemented");
+  return new Date(epochSeconds * 1000).toISOString();
 }
 
 /**
@@ -313,7 +391,16 @@ export function epochSecondsToIso(epochSeconds: number): string {
  * in your ADR — this is a real tolerant-reader judgment call, not a trick.
  */
 export function mapCurrencyCode(numericCode: number): string {
-  throw new Error("TODO: mapCurrencyCode is not implemented");
+  switch (numericCode) {
+    case 978:
+      return "EUR";
+    case 840:
+      return "USD";
+    case 826:
+      return "GBP";
+    default:
+      throw new Error(`Unsupported currency code: ${numericCode}`);
+  }
 }
 
 /**
@@ -323,7 +410,18 @@ export function mapCurrencyCode(numericCode: number): string {
  * TODO: implement the mapping above.
  */
 export function mapMobileStatus(code: number): OrderStatus {
-  throw new Error("TODO: mapMobileStatus is not implemented");
+  switch (code) {
+    case 1:
+      return "new";
+    case 2:
+      return "processing";
+    case 3:
+      return "shipped";
+    case 4:
+      return "delivered";
+    default:
+      throw new Error(`Unsupported mobile status: ${code}`);
+  }
 }
 
 /**
@@ -331,8 +429,19 @@ export function mapMobileStatus(code: number): OrderStatus {
  *
  * TODO: lowercase it. Decide what happens to a value you do not recognize.
  */
-export function mapB2BStatus(raw: string): OrderStatus {
-  throw new Error("TODO: mapB2BStatus is not implemented");
+export function mapB2BStatus(status: string): OrderStatus {
+  const normalized = status.toLowerCase();
+
+  if (
+    normalized === "new" ||
+    normalized === "processing" ||
+    normalized === "shipped" ||
+    normalized === "delivered"
+  ) {
+    return normalized;
+  }
+
+  throw new Error(`Unsupported B2B status: ${status}`);
 }
 
 /**
@@ -342,7 +451,18 @@ export function mapB2BStatus(raw: string): OrderStatus {
  * This is string work, not a library.
  */
 export function parseMobileAddress(addr: string): Address {
-  throw new Error("TODO: parseMobileAddress is not implemented");
+  const parts = addr.split(", ");
+
+  if (parts.length !== 4) {
+    throw new Error(`Invalid mobile address: ${addr}`);
+  }
+
+  return {
+    street: parts[0],
+    city: parts[1],
+    postalCode: parts[2],
+    country: parts[3],
+  };
 }
 
 /**
@@ -355,7 +475,7 @@ export function parseMobileAddress(addr: string): Address {
  * PA1's order file, applied to XML instead of a fixed-width record.
  */
 export function decodeB2BXmlBytes(bytes: Buffer): string {
-  throw new Error("TODO: decodeB2BXmlBytes is not implemented");
+  return new TextDecoder("windows-1257").decode(bytes);
 }
 
 // -------------------------------------------------------------- translators --
@@ -386,7 +506,44 @@ export async function translateWeb(
   webOrderPath: string,
   options: TranslateOptions,
 ): Promise<TransformResult> {
-  throw new Error("TODO: translateWeb is not implemented");
+  const input = JSON.parse(
+    readFileSync(webOrderPath, "utf8")
+  ) as WebOrderInput;
+
+  const lines = input.items.map((item) => ({
+    productId: normalizeProductId("web", item.productId),
+    productName: item.productName,
+    quantity: item.quantity,
+  }));
+
+  const { items, warnings } = await enrichItems(lines, options);
+
+  if (items.length === 0) {
+    return { order: null, warnings };
+  }
+
+  const order: CanonicalOrder = {
+    orderId: input.orderId,
+    orderType: input.orderType as CanonicalOrder["orderType"],
+    source: "web",
+    receivedAt: (options.now?.() ?? new Date()).toISOString(),
+    orderDate: new Date(input.orderDate).toISOString(),
+    customer: {
+      name: input.customer.name,
+      email: input.customer.email,
+      address: {
+        street: input.customer.address.street,
+        city: input.customer.address.city,
+        postalCode: input.customer.address.postalCode,
+        country: input.customer.address.country,
+      },
+    },
+    items,
+    currency: input.currency,
+    status: input.status as OrderStatus,
+  };
+
+  return { order, warnings };
 }
 
 /**
@@ -404,7 +561,39 @@ export async function translateMobile(
   mobileOrderPath: string,
   options: TranslateOptions,
 ): Promise<TransformResult> {
-  throw new Error("TODO: translateMobile is not implemented");
+  const input = JSON.parse(
+    readFileSync(mobileOrderPath, "utf8")
+  ) as MobileOrderInput;
+
+  const lines = input.items.map((item) => ({
+    productId: normalizeProductId("mobile", item.pid),
+    productName: item.pname,
+    quantity: item.qty,
+  }));
+
+  const { items, warnings } = await enrichItems(lines, options);
+
+  if (items.length === 0) {
+    return { order: null, warnings };
+  }
+
+  const order: CanonicalOrder = {
+    orderId: input.oid,
+    orderType: input.ot as CanonicalOrder["orderType"],
+    source: "mobile",
+    receivedAt: (options.now?.() ?? new Date()).toISOString(),
+    orderDate: epochSecondsToIso(input.ts),
+    customer: {
+      name: input.cust_name,
+      email: input.cust_email,
+      address: parseMobileAddress(input.addr),
+    },
+    items,
+    currency: mapCurrencyCode(input.cur),
+    status: mapMobileStatus(input.st),
+  };
+
+  return { order, warnings };
 }
 
 /**
@@ -435,7 +624,57 @@ export async function translateB2B(
   b2bOrderPath: string,
   options: TranslateOptions,
 ): Promise<TransformResult> {
-  throw new Error("TODO: translateB2B is not implemented");
+  const bytes = readFileSync(b2bOrderPath);
+  const xml = decodeB2BXmlBytes(bytes);
+  const parsed = xmlParser.parse(xml) as ParsedB2BOrder;
+  const input = parsed.PurchaseOrder;
+
+  const rawItems = input.LineItems.LineItem;
+
+  const lineItems = (
+    Array.isArray(rawItems) ? rawItems : [rawItems]
+  ) as Array<{
+    "@_sku": string;
+    "@_quantity": string;
+    Description: string;
+  }>;
+
+  const lines = lineItems.map((item) => ({
+    productId: normalizeProductId("b2b", item["@_sku"]),
+    productName: item.Description,
+    quantity: Number(item["@_quantity"]),
+  }));
+
+  const { items, warnings } = await enrichItems(lines, options);
+
+  if (items.length === 0) {
+    return { order: null, warnings };
+  }
+
+  const address = input.BuyerParty.ShipToAddress;
+
+  const order: CanonicalOrder = {
+    orderId: input["@_orderId"],
+    orderType: input["@_orderType"] as CanonicalOrder["orderType"],
+    source: "b2b",
+    receivedAt: (options.now?.() ?? new Date()).toISOString(),
+    orderDate: new Date(input["@_orderDate"]).toISOString(),
+    customer: {
+      name: input.BuyerParty.Name,
+      email: input.BuyerParty.ContactEmail,
+      address: {
+        street: address.Street,
+        city: address.City,
+        postalCode: address.PostalCode,
+        country: address["@_country"],
+      },
+    },
+    items,
+    currency: input.LineItems["@_currency"],
+    status: mapB2BStatus(input.Status),
+  };
+
+  return { order, warnings };
 }
 
 // -------------------------------------------------------------------- main --
