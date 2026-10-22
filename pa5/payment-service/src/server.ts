@@ -29,21 +29,36 @@ async function main(): Promise<void> {
 
     console.log(`[Payment] Processing ${correlationId} (attempt ${retryCount + 1})`);
 
-    try {
-      // TODO (student): Implement payment validation logic
-      // - Simulate success/failure based on FAIL_RATE (a random number 0-100;
-      //   below FAIL_RATE means failure)
-      // - On success: ack the message and publish a result event to
-      //   RESULTS_EXCHANGE — headers: { correlationId }, contentType:
-      //   "application/json", body shape:
-      //     { correlationId, source: "payment", status: "success", timestamp, details: { message } }
-      // - On failure: throw an Error to trigger the retry/DLQ logic below
-      //
-      // `order` (typed CanonicalOrder, from ../../shared/canonical-order) is
-      // available here if your validation wants to look at it (e.g. reject
-      // orders over some amount) — this simulation does not require it.
 
-      throw new Error("Not implemented — replace this with your logic");
+    try {
+      if (Math.random() * 100 < FAIL_RATE) {
+        throw new Error("Simulated payment failure");
+      }
+
+      const result = {
+        correlationId,
+        source: "payment",
+        status: "success",
+        timestamp: new Date().toISOString(),
+        details: {
+          message: `Payment validated for order ${order.orderId}`,
+        },
+      };
+
+      channel.ack(msg);
+
+      channel.publish(
+        RESULTS_EXCHANGE,
+        "",
+        Buffer.from(JSON.stringify(result)),
+        {
+          headers: { correlationId },
+          contentType: "application/json",
+          persistent: true,
+        },
+      );
+
+      console.log(`[Payment] Success for order ${order.orderId}`);
     } catch (err) {
       // Retry / DLQ logic (provided as reference — study this for the other
       // two services). Do not modify.

@@ -1,37 +1,133 @@
-/**
- * PA5 notification-service — EMPTY. Student implements everything below.
- *
- * Build:
- *   1. connectWithRetry(process.env.RABBITMQ_URL) from ../../shared/rabbit,
- *      then channel.prefetch(1).
- *   2. On startup, load /data/processed-ids.json (create it as `[]` if it
- *      does not exist yet — this file, and /data/notification.log, are
- *      bind-mounted so they survive `docker compose restart
- *      notification-service`; see ../../docs/adr-004.md for why this is a
- *      file and not an in-memory Set).
- *   3. channel.consume("notifications.queue", async (msg) => { ... }):
- *        - correlationId = msg.properties.headers?.correlationId
- *        - If correlationId is already in the processed-ids array: ack
- *          silently, log "duplicate skipped", do NOT touch
- *          notification.log. This is the idempotent-receiver requirement —
- *          the retry topology fans a retried message back out to every
- *          consumer queue (see ../../rabbitmq/definitions.json), so a
- *          notification you already logged WILL arrive again.
- *        - Otherwise: append one JSON line to /data/notification.log —
- *            {"correlationId":"...","orderId":"...","customerEmail":"...","timestamp":"...","message":"Order received"}
- *          (order is the canonical order from the message body — see
- *          ../../shared/canonical-order.ts for its shape), add
- *          correlationId to processed-ids and persist the array, ack, then
- *          publish a result event to results.notification with the same
- *          correlationId header.
- *   4. Same nack/retry/DLQ pattern as payment-service on any thrown error.
- *
- * The line below only keeps the container process alive so `docker compose
- * up --wait` succeeds against this untouched scaffold — delete it once your
- * own channel.consume(...) registration is what keeps the process alive.
- */
 
-// import { connectWithRetry, getRetryCount } from "../../shared/rabbit";
+import type { ConsumeMessage } from "amqplib";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import { connectWithRetry, getRetryCount } from "../../shared/rabbit";
+import type { CanonicalOrder } from "../../shared/canonical-order";
 
-setInterval(() => {}, 1 << 30);
-console.log("[notification-service] scaffold running, no consumer implemented yet");
+const QUEUE = "notifications.queue";
+const RESULTS_EXCHANGE = "results.notification";
+const MAX_RETRIES = Number(process.env.MAX_RETRIES) || 3;
+const DATA_DIR = "/data";
+const PROCESSED_IDS_FILE = `${DATA_DIR}/processed-ids.json`;
+const NOTIFICATION_LOG_FILE = `${DATA_DIR}/notification.log`;
+
+async function readProcessedIds(): Promise<Set<string>> {
+  try {
+    const content = await readFile(PROCESSED_IDS_FILE, "utf8");
+    const ids: unknown = JSON.parse(content);
+    if (!Array.isArray(ids)) {
+      throw new Error("Processed IDs file must contain a JSON array");
+    }
+    return new Set(ids.filter((id): id is string => typeof id === "string"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return new Set<string>();
+    }
+    throw error;
+  }
+}
+
+async function main(): Promise<void> {
+  await mkdir(DATA_DIR, { recursive: true });
+
+  // Ensure the persistent file exists before consuming messages.
+  try {
+    await readFile(PROCESSED_IDS_FILE, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await writeFile(PROCESSED_IDS_FILE, "[]\n", "utf8");
+  }
+
+  const { channel } = await connectWithRetry(process.env.RABBITMQ_URL!);
+  await channel.prefetch(1);
+
+  console.log(`[Notification] Consuming from ${QUEUE}`);
+
+  await channel.consume(QUEUE, async (msg: ConsumeMessage | null) => {
+    if (!msg) return;
+
+    let retryCount = getRetryCount(msg);
+
+    try {
+      const order = JSON.parse(msg.content.toString()) as CanonicalOrder;
+      const correlationId = msg.properties.headers?.["correlationId"] as
+        | string
+        | undefined;
+
+      if (!correlationId) {
+        throw new Error("Missing correlationId message header");
+      }
+
+      const processedIds = await readProcessedIds();
+
+      if (processedIds.has(correlationId)) {
+        channel.ack(msg);
+        console.log(`[Notification] duplicate skipped: ${correlationId}`);
+        return;
+      }
+
+      const notification = {
+        correlationId,
+        orderId: order.orderId,
+        customerEmail: order.customer.email,
+        timestamp: new Date().toISOString(),
+        message: "Order received",
+      };
+
+      await appendFile(
+        NOTIFICATION_LOG_FILE,
+        `${JSON.stringify(notification)}\n`,
+        "utf8",
+      );
+
+      processedIds.add(correlationId);
+      await writeFile(
+        PROCESSED_IDS_FILE,
+        `${JSON.stringify([...processedIds])}\n`,
+        "utf8",
+      );
+
+      const result = {
+        correlationId,
+        source: "notification",
+        status: "success",
+        timestamp: new Date().toISOString(),
+        details: { message: "Notification recorded" },
+      };
+
+      channel.ack(msg);
+      channel.publish(
+        RESULTS_EXCHANGE,
+        "",
+        Buffer.from(JSON.stringify(result)),
+        {
+          headers: { correlationId },
+          contentType: "application/json",
+          persistent: true,
+        },
+      );
+
+      console.log(`[Notification] Recorded for order ${order.orderId}`);
+    } catch (err) {
+      retryCount = getRetryCount(msg);
+
+      if (retryCount >= MAX_RETRIES - 1) {
+        channel.publish(process.env.DLQ_EXCHANGE!, "", msg.content, {
+          headers: msg.properties.headers,
+        });
+        channel.ack(msg);
+        console.log(
+          `[Notification] -> DLQ after ${retryCount + 1} attempts: ${(err as Error).message}`,
+        );
+      } else {
+        channel.nack(msg, false, false);
+        console.log(
+          `[Notification] -> Retry (attempt ${retryCount + 1}): ${(err as Error).message}`,
+        );
+      }
+    }
+  });
+}
+
+main().catch(console.error);
