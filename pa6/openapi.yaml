@@ -6,17 +6,24 @@ info:
     Worked example contract for the PA6 checkout saga. It documents the shape
     of POST /checkout and its downstream-orchestration side effects: payment
     authorization, inventory reservation, shipping creation and notification
-    delivery, executed in strict order with compensation on failure. This
-    file is a worked EXAMPLE for you to study, lint and diff against — it is
-    not the answer key. See README.md "How to use this file" before you copy
-    it verbatim.
+    delivery, executed in strict order with compensation on failure.
+  contact:
+    name: PA6 API Support
 servers:
   - url: http://localhost:3000
     description: Local orchestrator, started via docker compose.
+
+tags:
+  - name: Health
+    description: Health check operations.
+  - name: Checkout
+    description: Checkout orchestration operations.
+
 paths:
   /health:
     get:
       operationId: getHealth
+      tags: [Health]
       summary: Liveness probe
       description: Reports whether the orchestrator process is up and accepting requests.
       responses:
@@ -29,6 +36,7 @@ paths:
   /checkout:
     post:
       operationId: createCheckout
+      tags: [Checkout]
       summary: Run the checkout saga for one order
       description: >-
         Executes payment authorization, inventory reservation, shipping
