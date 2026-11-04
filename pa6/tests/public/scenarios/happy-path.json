@@ -1,18 +1,38 @@
+
 {
   "name": "happy-path",
-  "idempotencyKey": "idem-happy-001",
+  "idempotencyKey": "idem-happy-002",
   "payload": {
     "orderId": "ord-happy-001",
-    "customerId": "cust-1",
-    "recipient": "student@example.test",
+    "orderType": "standard",
+    "source": "web",
+    "receivedAt": "2026-11-04T10:00:00Z",
+    "orderDate": "2026-11-04T10:00:00Z",
+    "customer": {
+      "name": "Test Customer",
+      "email": "student@example.test",
+      "address": {
+        "street": "123 Main Street",
+        "city": "Riga",
+        "postalCode": "LV-1001",
+        "country": "Latvia"
+      }
+    },
     "items": [
-      { "sku": "p-100", "quantity": 1, "price": 9.99 }
+      {
+        "productId": "PROD-100",
+        "productName": "Test Product",
+        "quantity": 1,
+        "unitPrice": "9.99",
+        "currency": "EUR",
+        "taxRate": 0.21
+      }
     ],
-    "amount": 9.99
+    "currency": "EUR",
+    "status": "new"
   },
   "expected": {
     "httpStatus": 200,
     "status": "completed"
   }
 }
-

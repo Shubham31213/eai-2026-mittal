@@ -1,19 +1,4 @@
-/**
- * PA6 orchestrator scaffold — ported from the practice-03-orchestration JS lab.
- *
- * This scaffold is intentionally incomplete. `GET /health`, request validation,
- * the Idempotency-Key contract shell, and restart-safe file persistence are
- * already wired up. What is NOT implemented is the actual saga:
- *
- *   1) payment authorize
- *   2) inventory reserve
- *   3) shipping create
- *   4) notification send
- *
- * with strict sequencing, trace recording, timeout handling, compensation
- * (in reverse order of completed steps), and the full idempotent-replay
- * policy. See the TODO block inside the POST /checkout handler.
- */
+
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -58,11 +43,7 @@ const DATA_DIR = "/data";
 const IDEMPOTENCY_STORE_PATH = path.join(DATA_DIR, "idempotency-store.json");
 const SAGA_STORE_PATH = path.join(DATA_DIR, "saga-store.json");
 
-// ---------------------------------------------------------------- contract --
-// These shapes mirror grading/schema/*.json. Keep them in sync if you change
-// either side — the tests validate persisted files against those schemas.
-
-export interface TraceItem {
+interface TraceItem {
   step: string;
   status: string;
   startedAt: string;
@@ -70,8 +51,12 @@ export interface TraceItem {
   durationMs: number;
 }
 
-export type SagaState = "completed" | "failed" | "compensated";
-export type IdempotencyState = "in_progress" | "completed" | "failed" | "compensated";
+type SagaState = "completed" | "failed" | "compensated";
+type IdempotencyState =
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "compensated";
 
 interface IdempotencyRecord {
   requestHash: string;
@@ -96,24 +81,67 @@ interface SagaStore {
   sagas: Record<string, SagaRecord>;
 }
 
+interface CanonicalItem {
+  productId: string;
+  productName: string;
+  quantity: number;
+  unitPrice: string;
+  currency: string;
+  taxRate: number;
+}
+
+interface CanonicalOrder {
+  orderId: string;
+  orderType: "standard" | "express" | "b2b";
+  source: "web" | "mobile" | "b2b";
+  receivedAt: string;
+  orderDate: string;
+  customer: {
+    name: string;
+    email: string;
+    address: {
+      street: string;
+      city: string;
+      postalCode: string;
+      country: string;
+    };
+  };
+  items: CanonicalItem[];
+  currency: string;
+  status: "new" | "processing" | "shipped" | "delivered";
+}
+
 function ensureJsonFile(filePath: string, initialData: unknown): void {
   const dirPath = path.dirname(filePath);
+
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true });
   }
+
   if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, JSON.stringify(initialData, null, 2), "utf8");
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify(initialData, null, 2),
+      "utf8"
+    );
   }
 }
 
 function readJsonFile<T>(filePath: string): T {
   ensureJsonFile(filePath, {});
-  const raw = fs.readFileSync(filePath, "utf8");
-  return JSON.parse(raw || "{}") as T;
+  return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
 }
 
 function writeJsonFile(filePath: string, value: unknown): void {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf8");
+  const temporaryPath = `${filePath}.tmp`;
+
+  fs.writeFileSync(
+    temporaryPath,
+    JSON.stringify(value, null, 2),
+    "utf8"
+  );
+
+  fs.renameSync(temporaryPath, filePath);
 }
 
 function nowIso(): string {
@@ -122,38 +150,219 @@ function nowIso(): string {
 
 function payloadHash(payload: unknown): string {
   const normalized = JSON.stringify(payload);
-  const hash = crypto.createHash("sha256").update(normalized).digest("hex");
+  const hash = crypto
+    .createHash("sha256")
+    .update(normalized)
+    .digest("hex");
+
   return `sha256:${hash}`;
 }
 
-function validateCheckoutPayload(payload: any): string | null {
-  if (!payload || typeof payload !== "object") {
+function isObject(value: unknown): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
+function hasExactFields(
+  value: Record<string, unknown>,
+  allowed: string[]
+): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isDateTime(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+      value
+    ) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function validateCheckoutPayload(payload: unknown): string | null {
+  if (!isObject(payload)) {
     return "Request body must be a JSON object";
   }
-  if (typeof payload.orderId !== "string" || payload.orderId.trim() === "") {
-    return 'Field "orderId" is required and must be a non-empty string';
+
+  const orderFields = [
+    "orderId",
+    "orderType",
+    "source",
+    "receivedAt",
+    "orderDate",
+    "customer",
+    "items",
+    "currency",
+    "status",
+  ];
+
+  if (!hasExactFields(payload, orderFields)) {
+    return "Order contains unexpected fields";
   }
-  if (!Array.isArray(payload.items) || payload.items.length === 0) {
-    return 'Field "items" is required and must be a non-empty array';
+
+  for (const field of orderFields) {
+    if (payload[field] === undefined || payload[field] === null) {
+      return `Field "${field}" is required`;
+    }
   }
-  if (typeof payload.amount !== "number") {
-    return 'Field "amount" is required and must be numeric';
+
+  if (!isNonEmptyString(payload.orderId)) {
+    return "orderId must be a non-empty string";
   }
-  if (typeof payload.recipient !== "string" || payload.recipient.trim() === "") {
-    return 'Field "recipient" is required and must be a non-empty string';
+
+  if (
+    !["standard", "express", "b2b"].includes(
+      payload.orderType as string
+    )
+  ) {
+    return "Invalid orderType";
   }
+
+  if (!["web", "mobile", "b2b"].includes(payload.source as string)) {
+    return "Invalid source";
+  }
+
+  if (!isDateTime(payload.receivedAt) || !isDateTime(payload.orderDate)) {
+    return "Invalid order date-time";
+  }
+
+  if (
+    !["new", "processing", "shipped", "delivered"].includes(
+      payload.status as string
+    )
+  ) {
+    return "Invalid order status";
+  }
+
+  if (
+    typeof payload.currency !== "string"
+  ) {
+    return "Invalid order currency";
+  }
+
+  if (!isObject(payload.customer)) {
+    return "Invalid customer";
+  }
+
+  const customer = payload.customer;
+
+  if (
+    !hasExactFields(customer, ["name", "email", "address"]) ||
+    !isNonEmptyString(customer.name) ||
+    typeof customer.email !== "string" ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer.email)
+  ) {
+    return "Invalid customer name or email";
+  }
+
+  if (!isObject(customer.address)) {
+    return "Invalid customer address";
+  }
+
+  const address = customer.address;
+
+  if (
+    !hasExactFields(address, [
+      "street",
+      "city",
+      "postalCode",
+      "country",
+    ]) ||
+    !isNonEmptyString(address.street) ||
+    !isNonEmptyString(address.city) ||
+    !isNonEmptyString(address.postalCode) ||
+    typeof address.country !== "string"
+  ) {
+    return "Invalid customer address";
+  }
+
+  if (
+    !Array.isArray(payload.items) ||
+    payload.items.length < 1 ||
+    payload.items.length > 100
+  ) {
+    return "Order must contain between 1 and 100 items";
+  }
+
+  for (const item of payload.items) {
+    if (!isObject(item)) {
+      return "Invalid order item";
+    }
+
+    if (
+      !hasExactFields(item, [
+        "productId",
+        "productName",
+        "quantity",
+        "unitPrice",
+        "currency",
+        "taxRate",
+      ]) ||
+      typeof item.productId !== "string" ||
+      !/^PROD-[0-9]+$/.test(item.productId) ||
+      !isNonEmptyString(item.productName) ||
+      !Number.isInteger(item.quantity) ||
+      (item.quantity as number) < 1 ||
+      typeof item.unitPrice !== "string" ||
+      !/^-?[0-9]+\.[0-9]{2}$/.test(item.unitPrice) ||
+      typeof item.currency !== "string" ||
+      typeof item.taxRate !== "number" ||
+      !Number.isFinite(item.taxRate) ||
+      item.taxRate < 0 ||
+      item.taxRate > 1
+    ) {
+      return "Invalid order item";
+    }
+  }
+
   return null;
+}
+
+function calculateOrderAmount(items: CanonicalItem[]): string {
+  let totalCents = 0n;
+
+  for (const item of items) {
+    const negative = item.unitPrice.startsWith("-");
+    const unsigned = negative
+      ? item.unitPrice.slice(1)
+      : item.unitPrice;
+
+    const [whole, fraction] = unsigned.split(".");
+
+    const cents =
+     BigInt(whole ?? "0") * 100n + BigInt(fraction ?? "00");
+
+    totalCents +=
+      (negative ? -cents : cents) * BigInt(item.quantity);
+  }
+
+  const negative = totalCents < 0n;
+  const absolute = negative ? -totalCents : totalCents;
+
+  const whole = absolute / 100n;
+  const fraction = (absolute % 100n).toString().padStart(2, "0");
+
+  return `${negative ? "-" : ""}${whole}.${fraction}`;
 }
 
 function bootstrapStores(): void {
   ensureJsonFile(IDEMPOTENCY_STORE_PATH, { records: {} });
   ensureJsonFile(SAGA_STORE_PATH, { sagas: {} });
 }
+
 async function callService(
   url: string,
   body: unknown,
-  orderId: string,
-): Promise<any> {
+  orderId: string
+): Promise<{ status: number; data: any }> {
   const response = await axios.post(url, body, {
     timeout: config.requestTimeoutMs,
     headers: {
@@ -168,10 +377,11 @@ async function callService(
     data: response.data,
   };
 }
+
 function createTraceItem(
   step: string,
   status: string,
-  startedAt: number,
+  startedAt: number
 ): TraceItem {
   const finishedAt = Date.now();
 
@@ -183,26 +393,27 @@ function createTraceItem(
     durationMs: finishedAt - startedAt,
   };
 }
+
 function saveSaga(
   orderId: string,
   idempotencyKey: string,
   state: SagaState,
-  trace: TraceItem[],
+  trace: TraceItem[]
 ): void {
-  const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
+  const store = readJsonFile<SagaStore>(SAGA_STORE_PATH);
 
-  if (!sagaStore.sagas) {
-    sagaStore.sagas = {};
+  if (!store.sagas) {
+    store.sagas = {};
   }
 
-  sagaStore.sagas[orderId] = {
+  store.sagas[orderId] = {
     idempotencyKey,
     state,
-    steps: trace,
+    steps: [...trace],
     updatedAt: nowIso(),
   };
 
-  writeJsonFile(SAGA_STORE_PATH, sagaStore);
+  writeJsonFile(SAGA_STORE_PATH, store);
 }
 
 function saveIdempotency(
@@ -210,9 +421,11 @@ function saveIdempotency(
   requestHash: string,
   state: IdempotencyState,
   httpStatus: number,
-  response: unknown,
+  response: unknown
 ): void {
-  const store = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+  const store = readJsonFile<IdempotencyStore>(
+    IDEMPOTENCY_STORE_PATH
+  );
 
   if (!store.records) {
     store.records = {};
@@ -234,20 +447,25 @@ app.get("/health", (_req: Request, res: Response) => {
 });
 
 app.get("/debug/trace/:orderId", (req: Request, res: Response) => {
-  const orderIdParam = req.params.orderId ?? "";
-  const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
-  const saga = sagaStore?.sagas?.[orderIdParam];
+  const orderId = req.params.orderId ?? "";
+  const store = readJsonFile<SagaStore>(SAGA_STORE_PATH);
+  const saga = store.sagas?.[orderId];
+
   if (!saga) {
-    res.status(404).json({ code: "not_found", message: "No saga found for this orderId" });
+    res.status(404).json({
+      code: "not_found",
+      message: "No saga found for this orderId",
+    });
     return;
   }
+
   res.status(200).json(saga);
 });
 
 app.post("/checkout", async (req: Request, res: Response) => {
   const idempotencyKey = req.header("Idempotency-Key") ?? "";
 
-  if (!idempotencyKey) {
+  if (!idempotencyKey.trim()) {
     res.status(400).json({
       code: "validation_error",
       message: "Idempotency-Key header is required",
@@ -256,6 +474,7 @@ app.post("/checkout", async (req: Request, res: Response) => {
   }
 
   const validationError = validateCheckoutPayload(req.body);
+
   if (validationError) {
     res.status(400).json({
       code: "validation_error",
@@ -264,11 +483,17 @@ app.post("/checkout", async (req: Request, res: Response) => {
     return;
   }
 
-  const orderId: string = req.body.orderId;
-  const requestHash = payloadHash(req.body);
-  const store = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+  const order = req.body as CanonicalOrder;
+  const orderId = order.orderId;
+  const requestHash = payloadHash(order);
 
-  if (!store.records) store.records = {};
+  const store = readJsonFile<IdempotencyStore>(
+    IDEMPOTENCY_STORE_PATH
+  );
+
+  if (!store.records) {
+    store.records = {};
+  }
 
   const existing = store.records[idempotencyKey];
 
@@ -276,7 +501,7 @@ app.post("/checkout", async (req: Request, res: Response) => {
     if (existing.requestHash !== requestHash) {
       res.status(409).json({
         code: "idempotency_payload_mismatch",
-        message: "This Idempotency-Key is already used for a different payload",
+        message: "This key was used with a different payload",
       });
       return;
     }
@@ -293,14 +518,24 @@ app.post("/checkout", async (req: Request, res: Response) => {
     return;
   }
 
-  saveIdempotency(idempotencyKey, requestHash, "in_progress", 202, {
-    orderId,
-    status: "in_progress",
-  });
+  saveIdempotency(
+    idempotencyKey,
+    requestHash,
+    "in_progress",
+    202,
+    {
+      orderId,
+      status: "in_progress",
+      trace: [],
+    }
+  );
 
   const trace: TraceItem[] = [];
+
   let paymentCompleted = false;
   let inventoryCompleted = false;
+  let completed = false;
+
   let timedOut = false;
   let compensationFailed = false;
   let failureCode = "checkout_failed";
@@ -309,51 +544,73 @@ app.post("/checkout", async (req: Request, res: Response) => {
     step: string,
     url: string,
     body: unknown,
+    isCompensation = false
   ): Promise<boolean> {
     const startedAt = Date.now();
 
     try {
       const result = await callService(url, body, orderId);
-      const success = result.status >= 200 && result.status < 300;
+      const success =
+        result.status >= 200 && result.status < 300;
 
-      trace.push(createTraceItem(
-        step,
-        success ? "success" : "failed",
-        startedAt,
-      ));
+      trace.push(
+        createTraceItem(
+          step,
+          success ? "success" : "failed",
+          startedAt
+        )
+      );
 
-      if (!success) {
-        failureCode = typeof result.data?.code === "string"
-          ? result.data.code
-          : "checkout_failed";
+      if (!success && !isCompensation) {
+        failureCode =
+          typeof result.data?.code === "string"
+            ? result.data.code
+            : "checkout_failed";
       }
 
       saveSaga(orderId, idempotencyKey, "failed", trace);
+
       return success;
     } catch (error) {
       const isTimeout =
         axios.isAxiosError(error) &&
-        (error.code === "ECONNABORTED" || error.code === "ETIMEDOUT");
+        (error.code === "ECONNABORTED" ||
+          error.code === "ETIMEDOUT");
 
-      timedOut = isTimeout;
-      failureCode = isTimeout ? "timeout" : "checkout_failed";
+      trace.push(
+        createTraceItem(
+          step,
+          isTimeout ? "timeout" : "failed",
+          startedAt
+        )
+      );
 
-      trace.push(createTraceItem(step, "failed", startedAt));
+      if (!isCompensation) {
+        timedOut = isTimeout;
+        failureCode = isTimeout ? "timeout" : "checkout_failed";
+      }
+
       saveSaga(orderId, idempotencyKey, "failed", trace);
+
       return false;
     }
   }
 
   async function compensate(
     step: string,
-    url: string,
+    url: string
   ): Promise<void> {
-    const success = await runStep(step, url, { orderId });
+    const success = await runStep(
+      step,
+      url,
+      { orderId },
+      true
+    );
 
-    if (!success) compensationFailed = true;
+    if (!success) {
+      compensationFailed = true;
+    }
   }
-
-  let completed = false;
 
   try {
     const paymentOk = await runStep(
@@ -361,8 +618,8 @@ app.post("/checkout", async (req: Request, res: Response) => {
       `${config.paymentUrl}/payment/authorize`,
       {
         orderId,
-        amount: req.body.amount,
-      },
+        amount: calculateOrderAmount(order.items),
+      }
     );
 
     if (paymentOk) {
@@ -373,8 +630,8 @@ app.post("/checkout", async (req: Request, res: Response) => {
         `${config.inventoryUrl}/inventory/reserve`,
         {
           orderId,
-          items: req.body.items,
-        },
+          items: order.items,
+        }
       );
 
       if (inventoryOk) {
@@ -383,7 +640,7 @@ app.post("/checkout", async (req: Request, res: Response) => {
         const shippingOk = await runStep(
           "shipping",
           `${config.shippingUrl}/shipping/create`,
-          { orderId },
+          { orderId }
         );
 
         if (shippingOk) {
@@ -392,8 +649,8 @@ app.post("/checkout", async (req: Request, res: Response) => {
             `${config.notificationUrl}/notification/send`,
             {
               orderId,
-              recipient: req.body.recipient,
-            },
+              recipient: order.customer.email,
+            }
           );
 
           completed = notificationOk;
@@ -408,29 +665,33 @@ app.post("/checkout", async (req: Request, res: Response) => {
     if (inventoryCompleted) {
       await compensate(
         "inventory_release",
-        `${config.inventoryUrl}/inventory/release`,
+        `${config.inventoryUrl}/inventory/release`
       );
     }
 
     if (paymentCompleted) {
       await compensate(
         "payment_refund",
-        `${config.paymentUrl}/payment/refund`,
+        `${config.paymentUrl}/payment/refund`
       );
     }
   }
 
-  const finalStatus = completed
+  const finalStatus: SagaState = completed
     ? "completed"
     : compensationFailed
-      ? "compensated"
-      : "failed";
+      ? "failed"
+      : paymentCompleted || inventoryCompleted
+        ? "compensated"
+        : "failed";
 
   const httpStatus = completed
     ? 200
-    : timedOut
-      ? 504
-      : 422;
+    : compensationFailed
+      ? 422
+      : timedOut
+        ? 504
+        : 422;
 
   const responseBody: Record<string, unknown> = {
     orderId,
@@ -442,29 +703,20 @@ app.post("/checkout", async (req: Request, res: Response) => {
     responseBody.code = compensationFailed
       ? "compensation_failed"
       : failureCode;
-    responseBody.message = completed
-      ? "Checkout completed"
+
+    responseBody.message = compensationFailed
+      ? "One or more compensation steps failed"
       : "Checkout could not be completed";
   }
 
-  const sagaState: SagaState = completed
-    ? "completed"
-    : "failed";
-
-  saveSaga(orderId, idempotencyKey, sagaState, trace);
-
-  const idempotencyState: IdempotencyState = completed
-    ? "completed"
-    : compensationFailed
-      ? "compensated"
-      : "failed";
+  saveSaga(orderId, idempotencyKey, finalStatus, trace);
 
   saveIdempotency(
     idempotencyKey,
     requestHash,
-    idempotencyState,
+    finalStatus,
     httpStatus,
-    responseBody,
+    responseBody
   );
 
   res.status(httpStatus).json(responseBody);

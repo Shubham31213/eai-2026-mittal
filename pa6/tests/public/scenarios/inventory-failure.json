@@ -1,17 +1,37 @@
+
 {
   "name": "inventory-failure",
-  "idempotencyKey": "idem-inv-fail-001",
+  "idempotencyKey": "idem-inv-fail-002",
   "payload": {
     "orderId": "ord-inv-fail-001",
-    "customerId": "cust-3",
-    "recipient": "student@example.test",
+    "orderType": "standard",
+    "source": "web",
+    "receivedAt": "2026-11-04T10:00:00Z",
+    "orderDate": "2026-11-04T10:00:00Z",
+    "customer": {
+      "name": "Test Customer",
+      "email": "student@example.test",
+      "address": {
+        "street": "123 Main Street",
+        "city": "Riga",
+        "postalCode": "LV-1001",
+        "country": "Latvia"
+      }
+    },
     "items": [
-      { "sku": "p-300", "quantity": 3, "price": 7.0 }
+      {
+        "productId": "PROD-300",
+        "productName": "Test Product",
+        "quantity": 3,
+        "unitPrice": "7.00",
+        "currency": "EUR",
+        "taxRate": 0.21
+      }
     ],
-    "amount": 21.0
+    "currency": "EUR",
+    "status": "new"
   },
   "expected": {
     "httpStatus": 422
   }
 }
-

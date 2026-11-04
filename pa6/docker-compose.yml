@@ -1,3 +1,4 @@
+
 services:
   payment:
     build: ./mock-services/payment
@@ -94,3 +95,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  spectral:
+    image: stoplight/spectral:latest
+    working_dir: /w
+    volumes:
+      - ./:/w
+    command: ["lint", "/w/openapi.yaml", "--ruleset", "/w/.spectral.yaml"]

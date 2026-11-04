@@ -1,14 +1,34 @@
+
 {
   "name": "idempotency-replay",
-  "idempotencyKey": "idem-replay-001",
+  "idempotencyKey": "idem-replay-002",
   "payload": {
     "orderId": "ord-replay-001",
-    "customerId": "cust-5",
-    "recipient": "student@example.test",
+    "orderType": "standard",
+    "source": "web",
+    "receivedAt": "2026-11-04T10:00:00Z",
+    "orderDate": "2026-11-04T10:00:00Z",
+    "customer": {
+      "name": "Test Customer",
+      "email": "student@example.test",
+      "address": {
+        "street": "123 Main Street",
+        "city": "Riga",
+        "postalCode": "LV-1001",
+        "country": "Latvia"
+      }
+    },
     "items": [
-      { "sku": "p-500", "quantity": 1, "price": 12.5 }
+      {
+        "productId": "PROD-500",
+        "productName": "Test Product",
+        "quantity": 1,
+        "unitPrice": "12.50",
+        "currency": "EUR",
+        "taxRate": 0.21
+      }
     ],
-    "amount": 12.5
+    "currency": "EUR",
+    "status": "new"
   }
 }
-
